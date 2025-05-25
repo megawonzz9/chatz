@@ -7,3 +7,4 @@ edition = "2021"
 tokio = { version = "1", features = ["full"] }
 crossterm = "0.29"
 anyhow = "1.0"
+uuid = "1"
