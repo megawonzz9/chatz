@@ -1,21 +1,29 @@
-use std::{collections::HashSet, net::IpAddr, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    net::IpAddr,
+    sync::Arc,
+};
 use tokio::{
     io::{stdin, AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
-    sync::{broadcast, Mutex},
+    sync::{broadcast, watch, Mutex, RwLock},
 };
+
+type ConnectionMap = Arc<RwLock<HashMap<IpAddr, Vec<watch::Sender<()>>>>>;
 
 pub async fn run_server() -> anyhow::Result<()> {
     let listener = TcpListener::bind("0.0.0.0:8080").await?;
-    let (tx, _rx) = broadcast::channel::<String>(10);
+    let (tx, _rx) = broadcast::channel::<String>(100);
     let banned_ips = Arc::new(Mutex::new(HashSet::<IpAddr>::new()));
+    let connections: ConnectionMap = Arc::new(RwLock::new(HashMap::new()));
 
     println!("Server running on 0.0.0.0:8080");
 
-    // Wątek serwerowy do banowania z terminala
+    // Komendy serwerowe
     {
         let banned_ips = banned_ips.clone();
         let tx = tx.clone();
+        let connections = connections.clone();
 
         tokio::spawn(async move {
             let mut stdin_reader = BufReader::new(stdin());
@@ -31,8 +39,15 @@ pub async fn run_server() -> anyhow::Result<()> {
                 if trimmed.starts_with("!ban ") {
                     if let Ok(ip_to_ban) = trimmed[5..].parse::<IpAddr>() {
                         banned_ips.lock().await.insert(ip_to_ban);
-                        println!(">> IP {} has been banned by server admin.", ip_to_ban);
-                        let _ = tx.send(format!(">> IP {} was banned by server.\n", ip_to_ban));
+                        println!(">> IP {} has been banned.", ip_to_ban);
+                        let _ = tx.send(">> A user has been banned by the server.\n".to_string());
+
+                        let mut conn_map = connections.write().await;
+                        if let Some(senders) = conn_map.remove(&ip_to_ban) {
+                            for sender in senders {
+                                let _ = sender.send(()); // rozłączenie
+                            }
+                        }
                     } else {
                         println!(">> Invalid IP format.");
                     }
@@ -47,8 +62,7 @@ pub async fn run_server() -> anyhow::Result<()> {
         let (socket, addr) = listener.accept().await?;
         let ip = addr.ip();
 
-        let banned_ips_clone = banned_ips.clone();
-        if banned_ips_clone.lock().await.contains(&ip) {
+        if banned_ips.lock().await.contains(&ip) {
             println!("Rejected banned IP: {}", ip);
             continue;
         }
@@ -57,7 +71,12 @@ pub async fn run_server() -> anyhow::Result<()> {
 
         let tx = tx.clone();
         let mut rx = tx.subscribe();
-        let banned_ips = banned_ips.clone();
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(());
+
+        {
+            let mut conn_map = connections.write().await;
+            conn_map.entry(ip).or_default().push(shutdown_tx);
+        }
 
         tokio::spawn(async move {
             let (reader, mut writer) = socket.into_split();
@@ -66,6 +85,13 @@ pub async fn run_server() -> anyhow::Result<()> {
 
             loop {
                 tokio::select! {
+                    biased;
+
+                    _ = shutdown_rx.changed() => {
+                        let _ = writer.write_all(b">> You have been banned.\n").await;
+                        break;
+                    }
+
                     result = reader.read_line(&mut line) => {
                         if result.unwrap() == 0 {
                             println!("Client disconnected: {}", addr);
@@ -74,20 +100,15 @@ pub async fn run_server() -> anyhow::Result<()> {
 
                         let msg = line.trim().to_string();
 
-                        if msg.starts_with("!ban ") {
-                            if let Ok(ip_to_ban) = msg[5..].parse::<IpAddr>() {
-                                banned_ips.lock().await.insert(ip_to_ban);
-                                println!(">> IP {} banned by {}", ip_to_ban, addr);
-                                tx.send(format!(">> IP {} has been banned.\n", ip_to_ban)).ok();
-                            } else {
-                                writer.write_all(b">> Invalid IP format\n").await.ok();
-                            }
-                        } else {
-                            tx.send(format!("{}: {}\n", addr, msg)).ok();
-                        }
+                        // 🟩 Na terminalu serwera pokazujemy IP
+                        println!("{}: {}", addr, msg);
+
+                        // 🟥 Klientom wysyłamy tylko czysty tekst
+                        tx.send(format!("{}\n", msg)).ok();
 
                         line.clear();
                     }
+
                     result = rx.recv() => {
                         let msg = result.unwrap();
                         if writer.write_all(msg.as_bytes()).await.is_err() {
@@ -96,6 +117,8 @@ pub async fn run_server() -> anyhow::Result<()> {
                     }
                 }
             }
+
+            println!("Connection closed: {}", addr);
         });
     }
 }
