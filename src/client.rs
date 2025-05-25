@@ -32,9 +32,17 @@ pub async fn run_client() -> anyhow::Result<()> {
         }
     });
 
+    print!("enter nickname: ");
+    std::io::stdout().flush()?;
+
+    let mut nick = String::new();
+    std::io::stdin().read_line(&mut nick)?;
+    let nick = nick.trim();
+
     loop {
         input_line.clear();
         stdin.read_line(&mut input_line).await?;
+        input_line = format!("{}: {}", nick, input_line);
         writer.write_all(input_line.as_bytes()).await?;
     }
 }
