@@ -27,7 +27,7 @@ pub async fn run_server() -> anyhow::Result<()> {
                             println!("Client disconnected: {}", addr);
                             break;
                         }
-                        let msg = format!("{}: {}", addr, line);
+                        let msg = format!("{}", line);
                         tx.send(msg).unwrap();
                         line.clear();
                     }
